@@ -10,3 +10,4 @@ ENV/
 .idea/
 *.log
 test_images/
+whisk_bot_profile/

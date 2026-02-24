@@ -2,24 +2,20 @@ import os
 import time
 import re
 import subprocess
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 
-# 🔹 IMPORTANT: REPLACE THE PATH BELOW WITH YOUR ACTUAL CHROME USER DATA PATH
-# Example: r"C:\Users\YourName\AppData\Local\Google\Chrome\User Data"
-# We use the parent 'User Data' folder here, and specify 'Profile 45' in the launch args below.
-USER_DATA_DIR = r"C:\Users\Muhammad Ikram\AppData\Local\Google\Chrome\User Data"
-PROFILE_DIR = "Profile 45" # Specific profile directory name
+# Persistent browser profile — saves your login so you don't have to sign in every time.
+# This creates a separate folder just for this bot (won't interfere with your real Chrome).
+BOT_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisk_bot_profile")
 
-# Credentials
-EMAIL = "pat.ai.cummims@gmail.com"
-PASSWORD = "Pat@#(56561303)Good"
-
-# Folder containing images to process
-IMAGES_FOLDER = r"C:\Users\Muhammad Ikram\Desktop\Playwrite Bot\test_images"  # Update if needed
+# Folders containing images to process (two people working on it)
+IMAGES_FOLDER_1 = r"C:\Users\Muhammad Ikram\Desktop\Playwrite Bot\test_images"  # Person 1
+IMAGES_FOLDER_2 = r"D:\test images"  # Person 2
 
 # Whisk Lab URL
 WHISK_URL = "https://labs.google/fx/tools/whisk/project"
@@ -48,586 +44,579 @@ def kill_existing_chrome():
     except Exception as e:
         print(f"⚠️ Could not kill Chrome: {e}")
 
-def load_images(folder_path):
+def load_images(folder_paths):
     """
-    Reads all supported image files from a directory and sorts them.
+    Reads all supported image files from multiple directories and sorts them.
+    Returns a list of (full_path, filename) tuples.
     """
     supported_extensions = ('.png', '.jpg', '.jpeg', '.webp')
-    if not os.path.exists(folder_path):
-        print(f"❌ Error: Image folder not found at {folder_path}")
-        return []
+    all_images = []
 
-    images = [f for f in os.listdir(folder_path) if f.lower().endswith(supported_extensions)]
-    images.sort()  # Sort alphabetically
-    
-    print(f"📂 Found {len(images)} images in {folder_path}")
-    return images
+    for folder_path in folder_paths:
+        if not os.path.exists(folder_path):
+            print(f"⚠️ Image folder not found at {folder_path}, skipping...")
+            continue
+
+        images = [f for f in os.listdir(folder_path) if f.lower().endswith(supported_extensions)]
+        images.sort()
+        print(f"📂 Found {len(images)} images in {folder_path}")
+        for img in images:
+            all_images.append((os.path.join(folder_path, img), img))
+
+    print(f"📂 Total images to process: {len(all_images)}")
+    return all_images
+
+def find_section_container(page, section_name):
+    """
+    Finds the section header and its parent container for Subject/Scene/Style.
+    Returns (header, container) or (None, None).
+    """
+    try:
+        # Try exact match first, then regex
+        header = page.locator(f"h4:has-text('{section_name}')").first
+        if not header.is_visible(timeout=2000):
+            header = page.get_by_text(section_name, exact=True).first
+        
+        if not header.is_visible(timeout=1000):
+            return None, None
+        
+        # Walk up to find the parent container (needs to be tall enough to contain upload area)
+        container = header.locator("xpath=..")
+        for _ in range(6):
+            try:
+                box = container.bounding_box()
+                if box and box['height'] > 120:
+                    return header, container
+                container = container.locator("xpath=..")
+            except:
+                container = container.locator("xpath=..")
+        
+        return header, None
+    except:
+        return None, None
+
+def delete_existing_image(page, section_name, container):
+    """
+    Deletes any existing image in a section using the 'Delete image' button.
+    """
+    if not container:
+        return
+    try:
+        delete_btns = container.locator("button[aria-label='Delete image']").all()
+        for btn in delete_btns:
+            if btn.is_visible(timeout=500):
+                btn.click()
+                print(f"    🗑️ Deleted existing image in '{section_name}'.")
+                time.sleep(1)
+                return True
+    except:
+        pass
+    return False
 
 def upload_image(page, section_name, file_path, index=0):
     """
-    Uploads an image with extensive fallback and debug logging.
+    Uploads an image to a section (Subject/Scene/Style).
+    Strategy: 
+      1. Find the section container
+      2. Delete any existing image first
+      3. Try direct file input
+      4. Try clicking the empty upload area (draggable div)
+      5. Try clicking "Add new category" button
     """
     print(f"  ⬆️ Uploading to '{section_name}'...")
     try:
-        # 1. Find Header
-        header = page.get_by_text(section_name, exact=True).first
-        if not header.is_visible():
-             header = page.get_by_text(re.compile(f"^{section_name}", re.IGNORECASE)).first
+        header, container = find_section_container(page, section_name)
         
-        if not header.is_visible():
+        if not header:
             print(f"    ⚠️ Header for '{section_name}' not found.")
             return False
-            
+        
         header_box = header.bounding_box()
-        # 2. Find Container
-        container = header.locator("xpath=..")
-        card_found = None
-        for i in range(5):
-            try:
-                box = container.bounding_box()
-                if box and box['height'] > 150:
-                    card_found = container
-                    break
-                container = container.locator("xpath=..")
-            except: pass
-            
-        # Strategy A: Direct Input
-        if card_found:
-            inputs = card_found.locator("input[type='file']").all()
+        
+        # Step 1: Delete existing image if present
+        if container:
+            delete_existing_image(page, section_name, container)
+            time.sleep(1)
+            # Re-find container after deletion (DOM may have changed)
+            header, container = find_section_container(page, section_name)
+        
+        # Step 2: Try direct file input
+        if container:
+            inputs = container.locator("input[type='file']").all()
             if inputs:
-                print(f"    👉 Found {len(inputs)} file input(s). Attempting direct upload...")
+                print(f"    👉 Found {len(inputs)} file input(s). Uploading directly...")
                 try:
                     inputs[0].set_input_files(file_path)
-                    print("    ✅ Uploaded via direct input match.")
+                    print(f"    ✅ Uploaded to '{section_name}' via file input.")
+                    time.sleep(1)
                     return True
-                except: pass
+                except Exception as e:
+                    print(f"    ⚠️ Direct input failed: {e}")
         
-        # Strategy B: Visual Icon Search (SVG or IMG)
-        print("    👉 Fallback: locating Pencil/Icon...")
-        candidates = page.locator("svg, img, button:has(svg)").all()
-        target_icon = None
-        min_dist = 9999
-        
-        for icon in candidates:
-            if not icon.is_visible(): continue
-            box = icon.bounding_box()
-            if not box: continue
-            
-            # Check relative to header
-            dy = box['y'] - header_box['y']
-            dx = abs(box['x'] - (header_box['x'] + 20)) 
-            
-            if 20 < dy < 350 and dx < 300: 
-                 if dy < min_dist:
-                        min_dist = dy
-                        target_icon = icon
-                        
-        if target_icon:
-            icon_box = target_icon.bounding_box()
-            center_x = icon_box['x'] + icon_box['width'] / 2
-            bottom_y = icon_box['y'] + icon_box['height']
-            print(f"    👉 Found likely Icon at ({center_x}, {icon_box['y']}).")
-            
-            # Click Below
-            click_y = bottom_y + 60
-            print(f"    👉 Clicking 60px below icon at ({center_x}, {click_y})...")
+        # Step 3: Try clicking the empty draggable upload area
+        if container:
+            # The empty upload area is: div[role='button'][aria-roledescription='draggable'] with no <img> inside
+            draggable = container.locator("div[role='button'][aria-roledescription='draggable']").first
             try:
-                 with page.expect_file_chooser(timeout=5000) as fc:
-                     page.mouse.click(center_x, click_y)
-                 fc.value.set_files(file_path)
-                 print("    ✅ Uploaded via 'Click Below Icon'.")
-                 return True
-            except: pass
-            
-        # Final Fallback: Header Relative (if container failed)
-        if not card_found and not target_icon:
-             print(f"    ⚠️ Container not found. Trying Blind Click below Header...")
-             try:
-                 # Assume upload area is roughly 100px below header
-                 hx = header_box['x'] + header_box['width'] / 2
-                 hy = header_box['y'] + 100
-                 with page.expect_file_chooser(timeout=3000) as fc:
-                     page.mouse.click(hx, hy)
-                 fc.value.set_files(file_path)
-                 print("    ✅ Uploaded via Header-Relative Click.")
-                 return True
-             except: pass
-
-        # Strategy C: Text Search "Upload Image" (Any element)
-        if not card_found and not target_icon: # Only try if others failed
-            print("    👉 Fallback: Searching for 'Upload Image' text...")
-            if card_found:
-                text_el = card_found.get_by_text("Upload Image", exact=False).first
-                if text_el.is_visible():
-                    print("    👉 Found 'Upload Image' text element. Clicking...")
+                if draggable.is_visible(timeout=1000):
+                    # Check if it's empty (no image inside)
+                    has_img = draggable.locator("img").count() > 0
+                    if not has_img:
+                        print(f"    👉 Found empty upload area. Clicking...")
+                        try:
+                            with page.expect_file_chooser(timeout=5000) as fc:
+                                draggable.click()
+                            fc.value.set_files(file_path)
+                            print(f"    ✅ Uploaded to '{section_name}' via upload area click.")
+                            time.sleep(1)
+                            return True
+                        except Exception as e:
+                            print(f"    ⚠️ Upload area click failed: {e}")
+            except:
+                pass
+        
+        # Step 4: Try clicking below the header (blind click on upload zone)
+        if header_box:
+            print(f"    👉 Trying click below header...")
+            click_x = header_box['x'] + header_box['width'] / 2
+            click_y = header_box['y'] + 120
+            try:
+                with page.expect_file_chooser(timeout=5000) as fc:
+                    page.mouse.click(click_x, click_y)
+                fc.value.set_files(file_path)
+                print(f"    ✅ Uploaded to '{section_name}' via header-relative click.")
+                time.sleep(1)
+                return True
+            except:
+                pass
+        
+        # Step 5: Try "Add new category" button inside the section
+        if container:
+            try:
+                add_btn = container.locator("button[aria-label='Add new category']").first
+                if add_btn.is_visible(timeout=1000):
+                    print(f"    👉 Clicking 'Add new category' button...")
                     try:
                         with page.expect_file_chooser(timeout=5000) as fc:
-                            text_el.click()
+                            add_btn.click()
                         fc.value.set_files(file_path)
-                        print("    ✅ Uploaded via Text Click.")
+                        print(f"    ✅ Uploaded to '{section_name}' via 'Add new category'.")
+                        time.sleep(1)
                         return True
-                    except: pass
-
-        # --- NEW: Handle "Tiks" (Checkboxes) ---
-        # User: "dont turn off the tik and make sure they must be on"
-        # We look for a checkbox in the container and ensure it's checked.
-        if card_found:
-            checkboxes = card_found.locator("input[type='checkbox'], div[role='checkbox']").all()
-            if checkboxes:
-                print(f"    ☑️ Found {len(checkboxes)} checkbox(es). Ensuring they are ON...")
-                for cb in checkboxes:
-                    try:
-                        if cb.get_attribute("role") == "checkbox":
-                            if cb.get_attribute("aria-checked") == "false":
-                                cb.click()
-                                print("      👉 Clicked custom checkbox to ON.")
-                        elif not cb.is_checked():
-                            cb.check() # Native check
-                            print("      👉 Checked native checkbox.")
-                        else:
-                             print("      ✅ Checkbox already ON.")
-                    except Exception as cb_err:
-                        print(f"      ⚠️ Failed to handle checkbox: {cb_err}")
-            else:
-                 print("    ℹ️ No checkboxes found in this section.")
-
-        # Dump HTML for debugging
-        if card_found:
-            print(f"\n[DEBUG HTML Dump for {section_name}]\n")
-            print(card_found.inner_html()[:2000]) # First 2000 chars
-            print("\n[End Debug Dump]\n")
+                    except:
+                        pass
+            except:
+                pass
         
-        print("    ❌ Failed to trigger upload dialog.")
+        # Step 6: Search page-wide for any file inputs near this section
+        print(f"    👉 Last resort: scanning all file inputs on page...")
+        all_inputs = page.locator("input[type='file']").all()
+        if all_inputs:
+            # Pick the one closest in Y to our header
+            best_input = None
+            best_dist = 9999
+            for inp in all_inputs:
+                try:
+                    inp_box = inp.bounding_box()
+                    if inp_box and header_box:
+                        dist = abs(inp_box['y'] - header_box['y'])
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_input = inp
+                except:
+                    pass
+            
+            if best_input:
+                try:
+                    best_input.set_input_files(file_path)
+                    print(f"    ✅ Uploaded to '{section_name}' via nearest file input.")
+                    time.sleep(1)
+                    return True
+                except:
+                    pass
+        
+        print(f"    ❌ Failed to upload to '{section_name}'.")
         return False
 
     except Exception as e:
-        print(f"    ❌ Failed: {e}")
+        print(f"    ❌ Error uploading to '{section_name}': {e}")
         return False
 
-    except Exception as e:
-        print(f"    ❌ Failed to upload to {section_name}: {e}")
-        return False
-
-def login(page, email, password):
+def login(page):
     """
-    Attempts to log in to Google/Whisk.
-    Includes fallback to manual input if blocked.
+    Waits for the user to manually log in with their own Google account.
+    No credentials are hardcoded — each user logs in themselves.
     """
-    print("  🔑 Attempting automated login...")
-    try:
-        # Check if we are redirected to a login page
-        # Generic check: is there an email input?
-        try:
-            email_input = page.locator("input[type='email']")
-            if email_input.count() > 0:
-                print("    Found email input. Filling...")
-                email_input.first.fill(email)
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(3000) # Wait for password slide
-                
-                # Password
-                password_input = page.locator("input[type='password']")
-                if password_input.count() > 0:
-                    print("    Found password input. Filling...")
-                    password_input.first.fill(password)
-                    page.keyboard.press("Enter")
-                    
-                    print("    ⏳ Waiting for login navigation...")
-                    # Wait for either success (whisk url) or manual intervention needed
-                    page.wait_for_url("**/tools/whisk/**", timeout=15000)
-                    print("    ✅ Login appears successful.")
-                else:
-                    print("    ⚠️ Password input not found after email.")
-            else:
-                print("    ℹ️ Already logged in or no login form detected.")
-                
-        except Exception as step_err:
-             print(f"    ⚠️ Login step incomplete: {step_err}")
-
-    except Exception as e:
-        print(f"    ❌ Auto-login error: {e}")
-    
-    # Always offer manual fallback because Google bot detection varies
     print("\n" + "="*50)
-    print("⚠️  CHECK LOGIN STATUS")
-    print("If login requires 2FA or failed, please complete it manually now.")
+    print("🔑  MANUAL LOGIN REQUIRED")
+    print("Please log in with your Google account in the browser window.")
     print("="*50 + "\n")
-    # input("⌨️  Press Enter here in the terminal once logged in and ready... ")
-    # User asked to proceed, so we'll use a timeout-based check or just a short pause if it seemed to work?
-    # Better to keep the input for safety unless we are VERY sure.
-    # Given the user said "procceed further", let's try to verify if we are on the project page.
     
+    # STEP 1: Check if already logged in (persistent profile saves session)
+    print("    🔍 Checking if already logged in...")
+    page.wait_for_timeout(3000)
+    
+    # If we're already on the Whisk page with sections visible, skip login entirely
     try:
-        # Handle consecutive onboarding modals (User reported 2 screens)
-        print("    👀 Checking for onboarding modals (Welcome/Whisk it all together)...")
+        if page.locator("h4:has-text('Subject')").first.is_visible(timeout=3000):
+            print("    ✅ Already logged in! Sections visible. Skipping login.")
+            return
+    except:
+        pass
+    
+    # Check if we're on the Whisk page (not redirected to Google sign-in)
+    current_url = page.url
+    parsed = urlparse(current_url)
+    hostname = parsed.hostname or ""
+    
+    if "accounts.google" in hostname:
+        # Need to log in
+        print("    ⏳ Waiting for you to finish logging in...")
+        print("    (You only need to do this ONCE — your session will be saved)\n")
+    
+    for attempt in range(180):  # Wait up to ~6 minutes
+        current_url = page.url
+        parsed = urlparse(current_url)
+        hostname = parsed.hostname or ""
+        path = parsed.path or ""
         
-        # Loop to handle multiple sequential modals
-        max_modals = 5
-        for i in range(max_modals): 
-            try:
-                # 1. Check for "CONTINUE" (Standard onboarding)
-                continue_btn = page.get_by_role("button", name="CONTINUE").filter(has_text="CONTINUE").first
-                if continue_btn.is_visible(timeout=2000):
-                    print(f"    👋 Found 'CONTINUE' button. Clicking...")
-                    continue_btn.click()
-                    page.wait_for_timeout(4000)
-                    continue
-
-                # 2. Check for "Precise Mode" modal -> Click Close (X) button
-                # User requested to click the cross button for this specific screen
-                # 2. Check for "Precise Mode" modal -> Click Close (X) button
-                # User requested to click the cross button for this specific screen
-                if page.locator("text=Precise Mode").first.is_visible(timeout=3000):
-                     print("    👋 Found 'Precise Mode' modal. Clicking Close button...")
-                     # Try generic close button selectors usually found in dialogs
-                     close_btn = page.get_by_label("Close").first
-                     if not close_btn.is_visible():
-                         close_btn = page.locator("button[aria-label='Close']").first
-                         
-                     if close_btn.is_visible():
-                         close_btn.click()
-                         print("    ✅ Clicked Close button.")
-                         page.wait_for_timeout(2000)
-                     else:
-                         print("    ⚠️ Could not find explicit Close button. Sending Escape key.")
-                         page.keyboard.press("Escape")
-                         page.wait_for_timeout(1000)
-                     continue
-
-                # 3. Check if we are done (Upload text exists)
-                if page.locator("text=Upload").count() > 0:
-                    print("    ✅ 'Upload' text detected. Onboarding complete.")
-                    break
-                    
-            except Exception as e:
-                # Ignore errors during polling
-                time.sleep(1)
-
-        print("    ⏳ Verifying Project page access...")
+        # Accept any labs.google page (not accounts.google.com)
+        on_whisk = ("labs.google" in hostname and "accounts.google" not in hostname)
         
-        # 4. Handle Sidebar Toggle (User specific request)
-        print("    👀 Locating Black Circular Sidebar Toggle (Strict Mode)...")
+        # Also check if key UI elements are visible
+        has_ui = False
         try:
-            # We want to avoid the "Hamburger Menu" (usually top-left, yellow/transparent)
-            # We want the "Sidebar Toggle" (usually below menu, BLACK, circular)
-            
-            toggle_found = False
-            
-            # Helper to check if a button is likely the menu
-            def is_menu_button(btn):
-                label = (btn.get_attribute("aria-label") or "").lower()
-                text = (btn.text_content() or "").lower()
-                return "menu" in label or "navigation" in label or "menu" in text
-
-            # Helper to check if a button is likely the target (Black, Circular)
-            def is_target_candidate(btn):
-                if not btn.is_visible(): return False
-                box = btn.bounding_box()
-                if not box: return False
-                
-                # Geometrics: Left side, not too wide (icon button)
-                if box['x'] > 100 or box['width'] > 60: return False
-                
-                # Exclude top-left menu (usually y < 60)
-                # The sidebar toggle is usually centered vertically or below header
-                # Let's assume header is ~60px.
-                if box['y'] < 50: return False 
-                
-                return True
-
-            # Strategy 1: Explicit Accessible Name (Best Practice)
-            # "Expand sidebar", "Open sidebar", "Show tools"
-            potential_names = ["expand", "open sidebar", "show tools", "show project"]
-            for name in potential_names:
-                candidate = page.get_by_role("button", name=re.compile(name, re.IGNORECASE))
-                if candidate.count() > 0 and candidate.first.is_visible():
-                    print(f"    👉 Found toggle by name: '{name}'")
-                    # Double check it's not the menu
-                    if not is_menu_button(candidate.first):
-                         candidate.first.click()
-                         toggle_found = True
-                         break
-            
-            # Strategy 2: Visual Scan (Fallback if no name match)
-            if not toggle_found:
-                print("    ⚠️ Strategy 1 failed. Scanning left-side buttons visually...")
-                btns = page.locator("button").all()
-                
-                # Sort by Y position (Top to Bottom)
-                btns_sorted = []
-                for b in btns:
-                    if is_target_candidate(b):
-                        btns_sorted.append(b)
-                
-                btns_sorted.sort(key=lambda b: b.bounding_box()['y'])
-                
-                found_black_btn = False
-                
-                for btn in btns_sorted:
-                    # Check Background Color
-                    bg = btn.evaluate("el => window.getComputedStyle(el).backgroundColor")
-                    is_dark = "0, 0, 0" in bg or "32, 33, 36" in bg 
-                    
-                    # Check Shape
-                    box = btn.bounding_box()
-                    is_circle = abs(box['width'] - box['height']) < 8
-                    
-                    if is_dark:
-                         print(f"    👉 Found BLACK candidate at y={box['y']}. This is likely it.")
-                         try:
-                            btn.evaluate("el => el.style.border = '4px solid #00FF00'") # GREEN
-                            page.wait_for_timeout(500)
-                         except: pass
-                         
-                         btn.click()
-                         toggle_found = True
-                         found_black_btn = True
-                         break
-                    elif is_circle and not is_menu_button(btn):
-                         # Maybe it's not strictly black computed style but looks distinct
-                         print(f"    👉 Found CIRCULAR candidate at y={box['y']} (BG: {bg}). Checking...")
-                
-                if not found_black_btn and len(btns_sorted) > 0 and not toggle_found:
-                    # Last resort: click the first non-menu button below header
-                    print("    ⚠️ No black button found. Clicking first likely candidate below header...")
-                    btns_sorted[0].click()
-                    toggle_found = True
-
-            # Verification
-            if toggle_found:
-                 print("    ✅ Clicked a candidate button.")
-            else:
-                 print("    ❌ Could not identify sidebar toggle.")
-
-        except Exception as toggle_err:
-            print(f"    ❌ Error interacting with Sidebar Toggle: {toggle_err}")
-
-        print("    ⏳ Verifying Sidebar is Open (Key for next steps)...")
-        try:
-            # We NEED "Subject" or "Style" to be visible
-            page.wait_for_selector("text=Subject", timeout=4000)
-            print("    ✅ Sidebar is definitely OPEN.")
+            has_ui = (page.locator("h4:has-text('Subject')").first.is_visible(timeout=300) or
+                      page.locator("h4:has-text('Scene')").first.is_visible(timeout=300) or
+                      page.locator("text=Upload").first.is_visible(timeout=300))
         except:
-            print("\n" + "!"*50)
-            print("    ⚠️ SIDEBAR DID NOT OPEN AUTOMATICALLY.")
-            print("    Please manually click the BLACK BUTTON with the Arrow/Chevron on the left.")
-            print("!"*50 + "\n")
-            # Wait for user to fix it manually before failing
-            time.sleep(5)
+            pass
         
-        # Fallback check for Upload buttons
-        if page.locator("text=Upload").count() == 0:
-             print("    ⚠️ 'Upload' text not visible yet.")
+        if has_ui:
+            print(f"    ✅ Whisk UI detected! Sections are visible.")
+            return
         
-    except Exception as e:
-        print(f"    ⚠️ Could not assist past onboarding automatically: {e}")
-        print("    Please ensure you are on the Project page manually.")
+        if on_whisk:
+            print(f"    ✅ On Whisk page: {current_url[:80]}")
+            break
         
-        print("    🕵️ Starting manual fallback loop: Waiting for 'Upload' button...")
-        for _ in range(30): # Wait up to 60s more
-            if page.locator("text=Upload").count() > 0:
-                print("    ✅ Detected project page!")
+        if attempt % 15 == 0 and attempt > 0:
+            print(f"    ⏳ Still waiting... ({attempt * 2}s elapsed)")
+        time.sleep(2)
+    else:
+        print("    ⚠️ Timed out waiting for Whisk page. Continuing anyway...")
+    
+    # STEP 2: Wait for the page to fully load
+    print("    ⏳ Waiting for Whisk UI to fully load...")
+    page.wait_for_timeout(5000)  # Let the page settle
+    
+    # Handle onboarding modals
+    print("    👀 Checking for onboarding modals...")
+    for i in range(5):
+        try:
+            # CONTINUE button
+            continue_btn = page.get_by_role("button", name="CONTINUE").first
+            if continue_btn.is_visible(timeout=2000):
+                print(f"    👋 Clicking 'CONTINUE' button...")
+                continue_btn.click()
+                page.wait_for_timeout(3000)
+                continue
+            
+            # Precise Mode / any modal -> close or escape
+            modal_texts = ["Precise Mode", "What's new", "Welcome"]
+            for mt in modal_texts:
+                try:
+                    if page.locator(f"text={mt}").first.is_visible(timeout=1000):
+                        print(f"    👋 Found '{mt}' modal. Closing...")
+                        close_btn = page.locator("button[aria-label='Close'], button[aria-label='close']").first
+                        if close_btn.is_visible(timeout=1000):
+                            close_btn.click()
+                        else:
+                            page.keyboard.press("Escape")
+                        page.wait_for_timeout(2000)
+                        break
+                except:
+                    pass
+            
+            # Check if we can see section headers
+            if page.locator("h4:has-text('Subject')").first.is_visible(timeout=1000):
+                print("    ✅ Whisk UI loaded — sections visible.")
+                return
+                
+        except:
+            pass
+        time.sleep(1)
+    
+    # STEP 3: If sections aren't visible, the sidebar may need to be opened
+    print("    👀 Sections not visible yet. Trying to open sidebar...")
+    
+    # Try clicking sidebar toggle
+    sidebar_opened = False
+    try:
+        # Look for buttons with expand/sidebar/panel in aria-label
+        for name_pattern in ["expand", "open sidebar", "show tool", "show project", "panel"]:
+            btn = page.get_by_role("button", name=re.compile(name_pattern, re.IGNORECASE)).first
+            if btn.is_visible(timeout=1000):
+                print(f"    👉 Found sidebar toggle: '{name_pattern}'")
+                btn.click()
+                page.wait_for_timeout(3000)
+                sidebar_opened = True
                 break
-            time.sleep(2)
-        else:
-            print("    ❌ Timed out waiting for project page even after manual fallback time.")
+    except:
+        pass
+    
+    if not sidebar_opened:
+        # Scan for small icon buttons on the left side
+        try:
+            btns = page.locator("button").all()
+            for btn in btns:
+                if not btn.is_visible():
+                    continue
+                box = btn.bounding_box()
+                if not box:
+                    continue
+                # Left side, small, below header
+                if box['x'] < 80 and box['width'] < 60 and box['y'] > 50 and box['y'] < 400:
+                    label = (btn.get_attribute("aria-label") or "").lower()
+                    if "menu" not in label and "navigation" not in label:
+                        print(f"    👉 Trying left-side button at y={box['y']:.0f}...")
+                        btn.click()
+                        page.wait_for_timeout(3000)
+                        if page.locator("text=Subject").first.is_visible(timeout=2000):
+                            sidebar_opened = True
+                            print("    ✅ Sidebar opened!")
+                            break
+        except:
+            pass
+    
+    # STEP 4: Final verification — wait for Subject to be visible
+    print("    ⏳ Verifying sections are visible...")
+    for wait_attempt in range(30):  # Up to 60 seconds
+        try:
+            if page.locator("h4:has-text('Subject')").first.is_visible(timeout=1000):
+                print("    ✅ Ready! Subject/Scene/Style sections visible.")
+                return
+        except:
+            pass
+        
+        if wait_attempt == 10:
+            print("\n" + "!"*50)
+            print("    ⚠️ Sections still not visible after 20 seconds.")
+            print("    Please ensure you are on the Whisk project page")
+            print("    and the sidebar with Subject/Scene/Style is open.")
+            print("!"*50 + "\n")
+        time.sleep(2)
+    
+    print("    ⚠️ Could not verify sections. Proceeding anyway...")
 
 def run_generation(page):
     """
-    Clicks the Run button by finding the RIGHT-MOST element with a DARK BACKGROUND in the bottom area.
-    This avoids clicking the transparent 'Dice' or 'Aspect Ratio' buttons which are to the left of it.
+    Clicks the Run/Generate/Whisk button using multiple detection strategies.
     """
-    print("  ▶️ Clicking Run (Black Arrow Button)...")
+    print("  ▶️ Clicking Run button...")
     try:
-        # 1. Wait for 'Stop' button to disappear (generation in progress)
-        for i in range(15): 
+        # 1. Wait for any ongoing generation to finish first
+        for i in range(15):
             stop_btn = page.locator("button[aria-label*='Stop'], button[aria-label*='Cancel']").first
-            if stop_btn.is_visible():
-                print(f"    ⏳ Generation in progress (Stop button visible). Waiting... ({i+1}/15)")
-                time.sleep(2)
-            else:
+            try:
+                if stop_btn.is_visible(timeout=500):
+                    print(f"    ⏳ Previous generation running. Waiting... ({i+1}/15)")
+                    time.sleep(2)
+                else:
+                    break
+            except:
                 break
         
-        target_btn = None
+        # First, dump all button aria-labels for debug (one-time)
+        print("    🔍 Scanning all visible buttons...")
+        all_buttons = page.locator("button").all()
+        bottom_buttons_debug = []
+        vp = page.viewport_size or {"width": 1280, "height": 720}
         
-        # 2. Find Candidates (Broad Search)
-        # We look for ANY clickable element or SVG container
-        candidates = page.locator("button, [role='button'], div[onclick], a[role='button'], svg").all()
-        
-        vp_size = page.viewport_size
-        if not vp_size: vp_size = {"width": 1280, "height": 720}
-        
-        threshold_y = vp_size['height'] * 0.6 # Bottom 40%
-        threshold_x = vp_size['width'] * 0.5  # Right 50%
-        
-        valid_candidates = []
-        
-        for el in candidates:
-            if not el.is_visible(): continue
-            box = el.bounding_box()
-            if not box: continue
-            
-            # Position Check: Must be in bottom-right area
-            if box['y'] > threshold_y and box['x'] > threshold_x:
-                
-                # Visual Check: Must be DARK/BLACK background
-                # The other buttons (Dice, Aspect Ratio) are transparent or light gray
-                try:
-                   bg = el.evaluate("el => window.getComputedStyle(el).backgroundColor")
-                   # Check for black/dark gray (rgb values < 50)
-                   # bg acts like 'rgb(32, 33, 36)' or 'rgba(0, 0, 0, 0)'
-                   
-                   is_transparent = "rgba(0, 0, 0, 0)" in bg or "transparent" in bg
-                   if is_transparent: 
-                       continue # Skip transparent buttons (Dice, Aspect Ratio)
-
-                   # Parse RGB to be sure it's dark
-                   # Simple check: if it contains "255" it's white/light. If it contains small numbers it's dark.
-                   # Let's count low numbers.
-                   is_dark = "0, 0, 0" in bg or "32, 33, 36" in bg or "31, 31, 31" in bg or "26, 26, 26" in bg
-                   
-                   if is_dark:
-                       valid_candidates.append((el, box))
-                       # print(f"      Potential Candidate at x={box['x']}: BG={bg}")
-                except: pass
-
-        # Sort by X position (Descending) -> The Run button is the RIGHT-MOST element
-        if valid_candidates:
-            valid_candidates.sort(key=lambda x: x[1]['x'], reverse=True)
-            
-            target_btn = valid_candidates[0][0]
-            print(f"    👉 Found Best Candidate (Right-Most Black Button) at x={valid_candidates[0][1]['x']}")
-            
-            # Highlight for debug
+        for btn in all_buttons:
             try:
-                target_btn.evaluate("el => el.style.border = '5px solid red'")
-                time.sleep(0.5)
-            except: pass
-            
-            print("    👉 Clicking...")
-            try: 
-                target_btn.click(force=True)
-                print("    ✅ Clicked candidate.")
+                if not btn.is_visible(timeout=200):
+                    continue
+                box = btn.bounding_box()
+                if not box:
+                    continue
+                label = btn.get_attribute("aria-label") or ""
+                text = (btn.text_content() or "").strip()[:30]
+                # Log buttons in the bottom 50% for debug
+                if box['y'] > vp['height'] * 0.5:
+                    bottom_buttons_debug.append(f"'{label or text}' at ({box['x']:.0f},{box['y']:.0f})")
+            except:
+                continue
+        
+        if bottom_buttons_debug:
+            print(f"    📍 Bottom-area buttons: {', '.join(bottom_buttons_debug)}")
+        
+        # Strategy A: Find the "Whisk it" / "Run" / "Generate" button by aria-label
+        # Use EXACT or near-exact matches to avoid false positives (e.g., "go" matching "category")
+        exact_labels = ["Run", "Generate", "Whisk", "Whisk it", "Submit", "Create image"]
+        for label in exact_labels:
+            btn = page.locator(f"button[aria-label='{label}']").first
+            try:
+                if btn.is_visible(timeout=300):
+                    print(f"    👉 Found button: aria-label='{label}'")
+                    btn.click(force=True)
+                    print("    ✅ Clicked Run button.")
+                    return True
+            except:
+                continue
+        
+        # Strategy B: Find button by visible text content (exact role match)
+        text_patterns = ["Whisk it", "Run", "Generate", "Create"]
+        for text in text_patterns:
+            btn = page.get_by_role("button", name=text, exact=True).first
+            try:
+                if btn.is_visible(timeout=300):
+                    print(f"    👉 Found button with text: '{text}'")
+                    btn.click(force=True)
+                    print("    ✅ Clicked Run button.")
+                    return True
+            except:
+                continue
+        
+        # Strategy C: Find button containing a play/arrow SVG icon in the bottom area
+        # The Run button typically has a play_arrow or send icon
+        print("    👉 Looking for action button with arrow/play icon in bottom area...")
+        
+        all_btns = page.locator("button").all()
+        bottom_btns = []
+        
+        skip_labels = ["stop", "cancel", "delete", "download", "aspect", "inspire", 
+                        "add new", "category", "refine", "select", "menu", "close",
+                        "expand", "collapse"]
+        
+        for btn in all_btns:
+            try:
+                if not btn.is_visible(timeout=200):
+                    continue
+                box = btn.bounding_box()
+                if not box:
+                    continue
+                # Must be in the bottom 40% of the page
+                if box['y'] > vp['height'] * 0.6:
+                    label = (btn.get_attribute("aria-label") or "").lower()
+                    text = (btn.text_content() or "").strip().lower()
+                    # Skip known non-action buttons
+                    if any(x in label for x in skip_labels):
+                        continue
+                    if any(x in text for x in ["stop", "cancel"]):
+                        continue
+                    bottom_btns.append((btn, box))
+            except:
+                continue
+        
+        # Pick the right-most button in the bottom area (Run is typically the last action button)
+        if bottom_btns:
+            bottom_btns.sort(key=lambda x: x[1]['x'], reverse=True)
+            target = bottom_btns[0][0]
+            target_box = bottom_btns[0][1]
+            print(f"    👉 Clicking right-most bottom button at x={target_box['x']:.0f}, y={target_box['y']:.0f}")
+            try:
+                target.click(force=True)
+                print("    ✅ Clicked candidate button.")
                 return True
             except:
                 try:
-                    target_btn.evaluate("el => el.click()")
-                    print("    ✅ JS Clicked candidate.")
+                    target.evaluate("el => el.click()")
+                    print("    ✅ JS-clicked candidate button.")
                     return True
-                except: pass
+                except:
+                    pass
         
-        print("    ❌ Failed to find a valid Run button candidate (Right-Most Black Button).")
-        
-        # Fallback: Enter Key
-        print("    ⚠️ Fallback: Pressing Enter...")
+        # Strategy D: Keyboard shortcut
+        print("    ⚠️ No Run button found. Trying Enter key as fallback...")
         page.keyboard.press("Enter")
         return True
 
     except Exception as e:
-        print(f"    ❌ Error during generation: {e}")
+        print(f"    ❌ Error during run_generation: {e}")
         return False
 
 def clear_inputs(page):
     """
-    Clears inputs ONLY from Subject, Scene, and Style sections.
+    Clears uploaded images from Subject, Scene, and Style sections
+    using the 'Delete image' button (aria-label from actual UI).
     """
     print("  🧹 Clearing inputs (Subject, Scene, Style)...")
     sections = ["Subject", "Scene", "Style"]
     
     for section in sections:
         try:
-            # 1. Find Header
-            header = page.get_by_text(section, exact=True).first
-            if not header.is_visible():
-                 header = page.get_by_text(re.compile(f"^{section}", re.IGNORECASE)).first
-            
-            if not header.is_visible():
+            header, container = find_section_container(page, section)
+            if not container:
                 continue
-
-            # 2. Find Container
-            container = header.locator("xpath=..")
-            card_found = None
-            for i in range(5):
-                try:
-                    box = container.bounding_box()
-                    if box and box['height'] > 150:
-                        card_found = container
-                        break
-                    container = container.locator("xpath=..")
-                except: pass
             
-            if card_found:
-                 # 3. Find Remove Button INSIDE container
-                 # Look for 'X' button or aria-label 'Remove'/'Clear'
-                 found_remove = False
-                 btns = card_found.locator("button, div[role='button']").all()
-                 
-                 for btn in btns:
-                     if not btn.is_visible(): continue
-                     lbl = (btn.get_attribute("aria-label") or "").lower()
-                     txt = (btn.text_content() or "").lower()
-                     
-                     # Target "Remove image" or just "Remove" or "X"
-                     if "remove" in lbl or "clear" in lbl or "delete" in lbl or "x" == txt.strip():
-                         btn.click()
-                         print(f"    ✅ Cleared '{section}'.")
-                         found_remove = True
-                         time.sleep(0.5)
-                         break
-                 
-                 if not found_remove:
-                     # Check for specific "trash" icon if standard methods fail
-                     trash_icon = card_found.locator("svg[data-testid*='trash'], svg[class*='trash']").first
-                     if trash_icon.is_visible():
-                         # click parent button usually
-                         trash_icon.locator("xpath=..").click()
-                         print(f"    ✅ Cleared '{section}' via Trash Icon.")
+            # Delete all images in this section
+            deleted_any = False
+            for attempt in range(5):  # Handle multiple images per section
+                delete_btn = container.locator("button[aria-label='Delete image']").first
+                try:
+                    if delete_btn.is_visible(timeout=500):
+                        delete_btn.click()
+                        print(f"    ✅ Deleted image from '{section}'.")
+                        deleted_any = True
+                        time.sleep(0.5)
+                    else:
+                        break
+                except:
+                    break
+            
+            if not deleted_any:
+                # Fallback: try other remove/clear button labels
+                btns = container.locator("button, div[role='button']").all()
+                for btn in btns:
+                    try:
+                        if not btn.is_visible(timeout=200):
+                            continue
+                        lbl = (btn.get_attribute("aria-label") or "").lower()
+                        if any(word in lbl for word in ["remove", "clear", "delete", "close"]):
+                            btn.click()
+                            print(f"    ✅ Cleared '{section}' via '{lbl}'.")
+                            time.sleep(0.5)
+                            break
+                    except:
+                        continue
 
         except Exception as e:
-            print(f"    ⚠️ Error checking '{section}': {e}")
+            print(f"    ⚠️ Error clearing '{section}': {e}")
 
 def main():
     print("🚀 Starting Whisk Automation...")
     
-    images = load_images(IMAGES_FOLDER)
+    images = load_images([IMAGES_FOLDER_1, IMAGES_FOLDER_2])
     if not images:
         print("No images to process. Exiting.")
-        return
-
-    # Check if paths are placeholders
-    if "USERNAME" in USER_DATA_DIR:
-        print("\n⚠️  WARNING: You are using the default placeholder for USER_DATA_DIR.")
-        print("Please edit the script and set the correct path to your Chrome User Data.")
-        print("Example: user_data_dir = r'C:\\Users\\Bob\\AppData\\Local\\Google\\Chrome\\User Data'")
         return
 
     # Ensure clean slate
     kill_existing_chrome()
 
-    print("🔌 Launching Browser (Persistent Context)...")
+    print(f"🔌 Launching Browser (Persistent Profile: {BOT_PROFILE_DIR})...")
+    print("    ℹ️ Your login will be saved — you only need to sign in once!")
     
     with sync_playwright() as p:
         try:
-            # proper args for persistent context
-            # Launch Incognito Browser
-            browser = p.chromium.launch(
+            # Use persistent context so cookies/login are saved between runs
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=BOT_PROFILE_DIR,
                 headless=False,
                 executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 args=[
                     "--start-maximized",
-                    "--incognito",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-gpu"
                 ],
                 ignore_default_args=["--enable-automation"],
+                no_viewport=True,
                 timeout=60000
             )
             
-            # Create a new context and page
-            # Note: --start-maximized in args works best when no_viewport is handled or we rely on the window args.
-            # logic for max window size in playwright often needs no_viewport=True in new_context if not using persistent.
-            context = browser.new_context(no_viewport=True)
-            page = context.new_page()
+            # Get or create a page
+            page = context.pages[0] if context.pages else context.new_page()
 
             print(f"🌐 Navigating to {WHISK_URL}...")
             try:
@@ -635,14 +624,36 @@ def main():
             except Exception as nav_err:
                  print(f"    ⚠️ Navigation warning: {nav_err}")
             
-            # Perform Login
-            login(page, EMAIL, PASSWORD)
+            # Perform Login (manual — each user logs in with their own Google account)
+            login(page)
 
             print("\n🏁 Starting Image Processing Loop\n")
             
-            for idx, img_name in enumerate(images):
-                img_path = os.path.join(IMAGES_FOLDER, img_name)
-                print(f"[{idx+1}/{len(images)}] Processing: {img_name}")
+            # Debug: Print current page state before starting
+            print(f"    📍 Current URL: {page.url}")
+            print(f"    📍 Page title: {page.title()}")
+            try:
+                has_subject = page.locator("h4:has-text('Subject')").first.is_visible(timeout=2000)
+                has_scene = page.locator("h4:has-text('Scene')").first.is_visible(timeout=1000)
+                has_style = page.locator("h4:has-text('Style')").first.is_visible(timeout=1000)
+                print(f"    📍 Sections visible — Subject: {has_subject}, Scene: {has_scene}, Style: {has_style}")
+                
+                if not (has_subject or has_scene or has_style):
+                    print("    ⚠️ No sections visible! Waiting 15 seconds for page to load...")
+                    time.sleep(15)
+                    # Try one more time
+                    has_subject = page.locator("h4:has-text('Subject')").first.is_visible(timeout=3000)
+                    print(f"    📍 After wait — Subject visible: {has_subject}")
+                    
+                    if not has_subject:
+                        print("    ⚠️ Still no sections. Dumping page text for debug...")
+                        body_text = page.locator("body").inner_text()[:500]
+                        print(f"    📍 Page text: {body_text}")
+            except Exception as dbg_e:
+                print(f"    ⚠️ Debug check error: {dbg_e}")
+            
+            for idx, (img_path, img_name) in enumerate(images):
+                print(f"[{idx+1}/{len(images)}] Processing: {img_name} (from {os.path.dirname(img_path)})")
                 
                 # 1. Upload to all 3 sections (Sequence: Subject -> Scene -> Style)
                 # Ensure the SELECTORS["sections"] are in this order or sort them.
@@ -665,7 +676,44 @@ def main():
                 # 2. Run Generation (ALWAYS run this)
                 run_generation(page)
                 
-                # 3. Cleanup Inputs (ALWAYS run this to clear partial uploads or successful ones)
+                # 3. Wait for generation to complete before moving on
+                print("    ⏳ Waiting for generation to complete...")
+                generation_started = False
+                for wait_i in range(60):  # Wait up to ~2 minutes
+                    try:
+                        # Check if a Stop/Cancel button appears (means generation started)
+                        stop_btn = page.locator("button[aria-label*='Stop'], button[aria-label*='Cancel']").first
+                        if stop_btn.is_visible(timeout=500):
+                            if not generation_started:
+                                print("    🔄 Generation in progress...")
+                                generation_started = True
+                            time.sleep(2)
+                            continue
+                        
+                        # Check for loading/generating indicators
+                        if page.locator("text=Generating").first.is_visible(timeout=300):
+                            if not generation_started:
+                                print("    🔄 Generation in progress...")
+                                generation_started = True
+                            time.sleep(2)
+                            continue
+                        
+                        # If generation had started and stop button is gone, it's done
+                        if generation_started:
+                            print("    ✅ Generation complete!")
+                            time.sleep(2)
+                            break
+                        
+                        # If generation never visibly started, wait a bit and move on
+                        if wait_i > 5:
+                            print("    ⚠️ No generation detected. Moving on...")
+                            break
+                            
+                    except:
+                        pass
+                    time.sleep(2)
+                
+                # 4. Cleanup Inputs (ALWAYS run this to clear partial uploads or successful ones)
                 try:
                     clear_inputs(page)
                     print("    ⏳ Stabilizing UI after cleanup (5s)...")
@@ -678,7 +726,7 @@ def main():
             print("\n🎉 All images processed!")
             time.sleep(5) # Let user see final result
             
-            browser.close()
+            context.close()
             
         except Exception as e:
             print(f"\n❌ Critical Error: {e}")
